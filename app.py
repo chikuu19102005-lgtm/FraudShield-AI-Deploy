@@ -2,17 +2,10 @@ import streamlit as st
 import re
 import csv
 import os
+import json
+import random
 from datetime import datetime
 import pandas as pd
-
-from model_utils import ml_predict, keyword_risk_score
-from honeypot_bot import honeypot_reply
-
-
-
-# ================== LLM CONFIG (OLLAMA) ==================
-LLM_MODEL = "phi3:mini"   # or "mistral", "phi3", etc.
-
 
 # =================================================
 # =============== APP CONFIG ======================
@@ -24,34 +17,28 @@ st.set_page_config(
     layout="centered"
 )
 
-import json
-
+# =================================================
+# =============== DATABASE ========================
+# =================================================
 
 DB_DIR = "database"
 DB_FILE = os.path.join(DB_DIR, "honeypot_db.json")
 os.makedirs(DB_DIR, exist_ok=True)
 
 def load_db():
-    if not os.path.exists(DB_FILE):
+    if not os.path.exists(DB_FILE) or os.path.getsize(DB_FILE) == 0:
         return []
-
-    if os.path.getsize(DB_FILE) == 0:
-        return []
-
     try:
         with open(DB_FILE, "r", encoding="utf-8") as f:
             return json.load(f)
     except json.JSONDecodeError:
         return []
 
-
 def save_to_db(entry):
     data = load_db()
     data.append(entry)
     with open(DB_FILE, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
-
-
 
 # =================================================
 # =============== CONTINUOUS LEARNING =============
@@ -70,6 +57,71 @@ def save_chat_for_learning(chat_history):
             writer.writerow(["role", "message"])
         for role, msg in chat_history:
             writer.writerow([role, msg])
+
+# =================================================
+# =============== KEYWORD ENGINE ==================
+# =================================================
+
+SCAM_KEYWORDS = {
+    "upi": ["upi", "@upi", "paytm", "gpay", "phonepe"],
+    "bank": ["account", "kyc", "ifsc", "atm", "debit", "credit"],
+    "otp": ["otp", "one time password", "verification code"],
+    "delivery": ["courier", "parcel", "delivery", "shipment"],
+    "urgency": ["urgent", "immediately", "act now", "limited time"],
+    "reward": ["winner", "lottery", "prize", "reward", "jackpot", "mega draw"],
+    "job": ["job offer", "work from home", "easy money"],
+    "link": ["http", "https", ".com", ".link"]
+}
+
+def keyword_risk_score(text):
+    detected = set()
+    for words in SCAM_KEYWORDS.values():
+        for w in words:
+            if w in text:
+                detected.add(w)
+    return len(detected), list(detected)
+
+# =================================================
+# =============== HONEYPOT REPLIES =================
+# =================================================
+
+RESPONSES = {
+    0: [
+        "Hello, I received your message. What is this about?",
+        "Hi, can you explain this to me?",
+        "Sorry, I didn’t understand this message.",
+        "Why did you contact me?",
+        "Can you tell me more about this?"
+    ],
+    1: [
+        "I’m not very good with phones. What should I do?",
+        "I’m a bit confused. Can you explain slowly?",
+        "Why are you asking me for details?",
+        "I don’t usually get messages like this."
+    ],
+    2: [
+        "Is this safe to do?",
+        "Why do I need to do this now?",
+        "Are you sure this is official?",
+        "This sounds suspicious."
+    ],
+    3: [
+        "I’m not comfortable sharing my information.",
+        "I think I should ask someone first.",
+        "I will visit the bank instead.",
+        "I don’t trust this."
+    ],
+    4: [
+        "This looks like a scam.",
+        "Do not contact me again.",
+        "I will report this.",
+        "You should stop scamming people."
+    ]
+}
+
+def honeypot_reply(step):
+    step = min(step, max(RESPONSES.keys()))
+    return random.choice(RESPONSES[step])
 
 # =================================================
 # =============== SESSION STATE ===================
@@ -99,7 +151,7 @@ for key, value in defaults.items():
 st.markdown("""
 <h1 style='text-align:center;'>🚨 FraudShield AI</h1>
 <h4 style='text-align:center;color:gray;'>
-Silent Scam Detection + AI Honeypot System
+Silent Scam Detection + Honeypot System
 </h4>
 <hr>
 """, unsafe_allow_html=True)
@@ -127,22 +179,18 @@ def clean_text(text):
 # =================================================
 
 if st.button("🔍 Process Message") and message:
-    # Reset previous conversation
     st.session_state.pop("conversation_id", None)
     st.session_state.honeypot_active = False
     st.session_state.chat_history = []
     st.session_state.detected_words = []
 
     clean = clean_text(message)
-    keyword_score, detected = keyword_risk_score(clean)
+    _, detected = keyword_risk_score(clean)
 
-    # 🔴 ONLY trigger honeypot if scam words are present
     if detected:
         st.session_state.honeypot_active = True
         st.session_state.detected_words = detected
-        st.success(
-            f"🚨 Scam keywords detected: {', '.join(detected)}. Honeypot engaged."
-        )
+        st.success(f"🚨 Scam keywords detected: {', '.join(detected)}")
     else:
         st.info("✅ No scam keywords detected. Message ignored.")
 
@@ -158,67 +206,37 @@ def extract_entities(text):
         "bank": re.findall(r'\baccount\b|\bkyc\b|\bifsc\b', text, re.IGNORECASE)
     }
 
-def extract_patterns(chat_history):
-    combined = " ".join(m.lower() for _, m in chat_history)
-    patterns = []
-
-    if "dear winner" in combined:
-        patterns.append("Generic greeting")
-    if "fee" in combined and ("won" in combined or "prize" in combined):
-        patterns.append("Fee before reward")
-    if "urgent" in combined or "act fast" in combined:
-        patterns.append("Urgency pressure")
-
-    return patterns
-
 # =================================================
-# =============== AI HONEYPOT =====================
+# =============== HONEYPOT ========================
 # =================================================
 
 if st.session_state.honeypot_active:
-    st.markdown("## 🤖 AI Honeypot Chatbot")
-    st.info("Victim bot is safely engaging the sender.")
-
+    st.markdown("## 🤖 Honeypot Chatbot")
     scammer_msg = st.text_input("🧑‍💼 Scammer Message")
 
     if scammer_msg:
         step = len(st.session_state.chat_history)
+        bot_reply = honeypot_reply(step)
 
-        typing = st.empty()
-        typing.info("🤖 Victim is typing...")
-
-        bot_reply = honeypot_reply(
-            scammer_msg,
-            st.session_state.detected_words,
-            step,
-            model_name=LLM_MODEL
-            )
-
-        typing.empty()
-
-        # save chat
         st.session_state.chat_history.extend([
             ("Scammer", scammer_msg),
             ("Victim Bot", bot_reply)
         ])
-
 
         db_entry = {
             "conversation_id": st.session_state.get(
                 "conversation_id",
                 datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
             ),
-        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "scammer_message": scammer_msg,
-        "victim_reply": bot_reply,
-        "detected_keywords": st.session_state.detected_words,
-        "confidence_level": len(st.session_state.detected_words) * 15 + step * 5
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "scammer_message": scammer_msg,
+            "victim_reply": bot_reply,
+            "detected_keywords": st.session_state.detected_words,
+            "confidence_level": len(st.session_state.detected_words) * 15 + step * 5
         }
 
         st.session_state["conversation_id"] = db_entry["conversation_id"]
         save_to_db(db_entry)
-
-
         save_chat_for_learning(st.session_state.chat_history)
 
         st.session_state.interaction_log.append({
@@ -227,23 +245,14 @@ if st.session_state.honeypot_active:
             "Bot": bot_reply
         })
 
-        # update fraud stats
         entities = extract_entities(" ".join([m for _, m in st.session_state.chat_history]))
         st.session_state.fraud_stats["UPI IDs"] += len(entities["upi"])
         st.session_state.fraud_stats["Scam Links"] += len(entities["links"])
         st.session_state.fraud_stats["Phone Numbers"] += len(entities["phones"])
         st.session_state.fraud_stats["Bank Mentions"] += len(entities["bank"])
 
-    # ---- Conversation ----
     for role, msg in st.session_state.chat_history:
         st.markdown(f"**{role}:** {msg}")
-
-    # ---- Patterns ----
-    patterns = extract_patterns(st.session_state.chat_history)
-    if patterns:
-        st.markdown("## 🧠 Fraud Patterns Learned")
-        for p in patterns:
-            st.write(f"• {p}")
 
 # =================================================
 # =============== DASHBOARD =======================
@@ -275,6 +284,6 @@ if st.session_state.interaction_log:
 st.markdown("""
 <hr>
 <p style='text-align:center;color:gray;font-size:14px;'>
-FraudShield AI | AI-Powered Honeypot Scam Defense 🇮🇳
+FraudShield AI | Keyword-Based Honeypot Scam Defense 🇮🇳
 </p>
 """, unsafe_allow_html=True)
